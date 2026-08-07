@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# netmon runtime output (created next to config.toml)
+logs/
+config.toml
+connection-health*.png
+connection-health*.pdf
