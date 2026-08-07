@@ -141,7 +141,14 @@ Each second the monitor pings `ping_target_ip` on a fixed-rate schedule
 so ping duration cannot make the cadence drift — and one ping per second
 means exactly that, never a flood).
 
-On the first failed ping an outage event opens, named for its start time.
+After `outage_open_after_failures` consecutive failed pings (default 3 in
+the example config; set to 1 for maximum sensitivity) an outage event
+opens, named for — and starting at — the **first** failed ping of the run.
+Failures below the threshold are "blips": still logged and counted in loss
+statistics, but they trigger no traceroutes and no event. Pre-threshold
+failure records are briefly buffered (at most a couple of seconds) so that
+when an outage is confirmed, every record from the first failure onward
+carries the event's id.
 A worker thread runs every configured on-failure action immediately, then
 again every `traceroute_interval_seconds` until a ping succeeds, so a
 shifting failure point is captured over the course of the event. The

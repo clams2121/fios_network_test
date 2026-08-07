@@ -50,6 +50,7 @@ class Config:
     ping_interval_seconds: float
     ping_timeout_seconds: float
     traceroute_interval_seconds: float
+    outage_open_after_failures: int
     log_dir: Path
     traceroute_dir: Path
     ip_ownership_file: Path
@@ -86,6 +87,13 @@ def _require_positive(raw: dict, key: str) -> float:
     value = _require(raw, key, float, "number")
     if value <= 0:
         raise ConfigError(f"'{key}' must be > 0, got {value}")
+    return value
+
+
+def _require_positive_int(raw: dict, key: str) -> int:
+    value = _require(raw, key, int, "integer")
+    if value < 1:
+        raise ConfigError(f"'{key}' must be >= 1, got {value}")
     return value
 
 
@@ -182,6 +190,9 @@ def load_config(path: str | Path, *, prepare_dirs: bool = True) -> Config:
         ping_timeout_seconds=_require_positive(raw, "ping_timeout_seconds"),
         traceroute_interval_seconds=_require_positive(
             raw, "traceroute_interval_seconds"
+        ),
+        outage_open_after_failures=_require_positive_int(
+            raw, "outage_open_after_failures"
         ),
         log_dir=_path("log_dir"),
         traceroute_dir=_path("traceroute_dir"),

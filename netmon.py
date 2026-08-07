@@ -48,6 +48,16 @@ def now_local() -> dt.datetime:
     return dt.datetime.now().astimezone()
 
 
+def say(message: str) -> None:
+    """Console status chatter.  A dead stdout (broken pipe when a parent
+    process goes away) must never take the monitor down with it — the
+    evidence lives in files, not on the console."""
+    try:
+        print(message, flush=True)
+    except OSError:
+        pass
+
+
 class MonitorErrorLog:
     """Loud, timestamped log for problems with the monitor itself."""
 
@@ -58,7 +68,10 @@ class MonitorErrorLog:
     def report(self, message: str) -> None:
         line = f"{now_local().isoformat()} {message}"
         with self._lock:
-            print(f"MONITOR ERROR: {message}", file=sys.stderr, flush=True)
+            try:
+                print(f"MONITOR ERROR: {message}", file=sys.stderr, flush=True)
+            except OSError:
+                pass  # dead stderr must not stop the file record below
             with open(self.path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
 
@@ -149,7 +162,10 @@ class OutageWorker(threading.Thread):
         ip_lock: threading.Lock,
         error_log: MonitorErrorLog,
     ):
-        super().__init__(name=f"outage-{event_id}", daemon=False)
+        # daemon=True: if the main thread ever dies unexpectedly, the worker
+        # must not keep the process alive and traceroute forever.  The clean
+        # shutdown path still joins the worker explicitly.
+        super().__init__(name=f"outage-{event_id}", daemon=True)
         self.event_dir = event_dir
         self.actions = actions
         self.interval_s = interval_s
@@ -159,22 +175,27 @@ class OutageWorker(threading.Thread):
         self.cleared = threading.Event()
 
     def run(self) -> None:
-        self.event_dir.mkdir(parents=True, exist_ok=True)
-        while True:
-            cycle_start = time.monotonic()
-            for action in self.actions:
-                if self.cleared.is_set():
-                    break
-                try:
-                    ips = action.run(self.event_dir)
-                except ActionError as exc:
-                    self.error_log.report(str(exc))
-                    continue
-                with self.ip_lock:
-                    self.seen_ips |= ips
-            elapsed = time.monotonic() - cycle_start
-            if self.cleared.wait(max(0.0, self.interval_s - elapsed)):
-                return
+        try:
+            self.event_dir.mkdir(parents=True, exist_ok=True)
+            while True:
+                cycle_start = time.monotonic()
+                for action in self.actions:
+                    if self.cleared.is_set():
+                        break
+                    try:
+                        ips = action.run(self.event_dir)
+                    except ActionError as exc:
+                        self.error_log.report(str(exc))
+                        continue
+                    with self.ip_lock:
+                        self.seen_ips |= ips
+                elapsed = time.monotonic() - cycle_start
+                if self.cleared.wait(max(0.0, self.interval_s - elapsed)):
+                    return
+        except Exception as exc:  # never a silently wedged worker
+            self.error_log.report(
+                f"outage worker for {self.event_dir.name} crashed: {exc!r}"
+            )
 
 
 class Monitor:
@@ -190,17 +211,21 @@ class Monitor:
         self.outage_id: str | None = None
         self.outage_count = 0
         self.consecutive_monitor_errors = 0
+        # Failure records buffered until outage_open_after_failures
+        # consecutive failures confirm a real outage (see _record).
+        self.pending_failures: list[dict] = []
+        self.pending_start: dt.datetime | None = None
+        self._shutdown_done = False
 
     # -- outage event lifecycle -------------------------------------------
     def _open_outage(self, started: dt.datetime) -> None:
         self.outage_id = started.strftime("%Y-%m-%dT%H-%M-%S")
         self.outage_count += 1
         event_dir = self.config.traceroute_dir / f"traceroute-{self.outage_id}"
-        print(
+        say(
             f"{started.isoformat()} OUTAGE START (event {self.outage_id}); "
             f"running on-failure actions every "
-            f"{self.config.traceroute_interval_seconds}s",
-            flush=True,
+            f"{self.config.traceroute_interval_seconds}s"
         )
         self.worker = OutageWorker(
             self.outage_id,
@@ -214,10 +239,7 @@ class Monitor:
         self.worker.start()
 
     def _close_outage(self) -> None:
-        print(
-            f"{now_local().isoformat()} OUTAGE END (event {self.outage_id})",
-            flush=True,
-        )
+        say(f"{now_local().isoformat()} OUTAGE END (event {self.outage_id})")
         self.worker.cleared.set()
         self.worker.join()
         self.worker = None
@@ -226,46 +248,59 @@ class Monitor:
     # -- main loop --------------------------------------------------------
     def run(self) -> int:
         config = self.config
-        print(
+        say(
             f"netmon: pinging {config.ping_target_ip} every "
             f"{config.ping_interval_seconds}s "
             f"(timeout {config.ping_timeout_seconds}s); on failure: "
             + ", ".join(a.name for a in self.actions)
-            + f" -> {config.traceroute_dir}",
-            flush=True,
+            + f" -> {config.traceroute_dir}"
         )
-        next_tick = time.monotonic()
-        while not self.stop_event.is_set():
-            timestamp = now_local()
-            outcome = run_ping(
-                config.ping_target_ip, config.ping_timeout_seconds
-            )
-            if outcome.success is None and self.stop_event.is_set():
-                # The shutdown signal reached the ping child too (systemd
-                # and shells signal the whole process group).  An
-                # interrupted probe is not evidence of anything — discard.
-                break
-            self._record(timestamp, outcome)
-            if self.consecutive_monitor_errors >= (
-                MAX_CONSECUTIVE_MONITOR_ERRORS
-            ):
-                self.error_log.report(
-                    f"aborting: {self.consecutive_monitor_errors} consecutive "
-                    f"monitor errors — this is a problem with the monitoring "
-                    f"host, not evidence of a network outage"
+        exit_code = 0
+        # try/finally: no matter how the loop ends — signal, abort, or an
+        # unexpected exception — the logs get flushed, the worker gets
+        # stopped, and the ownership lookups run.
+        try:
+            next_tick = time.monotonic()
+            while not self.stop_event.is_set():
+                timestamp = now_local()
+                outcome = run_ping(
+                    config.ping_target_ip, config.ping_timeout_seconds
                 )
-                self.shutdown()
-                return 1
-            next_tick += config.ping_interval_seconds
-            delay = next_tick - time.monotonic()
-            if delay > 0:
-                self.stop_event.wait(delay)
-            else:
-                # We fell behind (e.g. suspend/resume). Re-anchor instead of
-                # firing a burst of catch-up pings.
-                next_tick = time.monotonic()
-        self.shutdown()
-        return 0
+                if outcome.success is None and self.stop_event.is_set():
+                    # The shutdown signal reached the ping child too
+                    # (systemd and shells signal the whole process group).
+                    # An interrupted probe is not evidence of anything.
+                    break
+                self._record(timestamp, outcome)
+                if self.consecutive_monitor_errors >= (
+                    MAX_CONSECUTIVE_MONITOR_ERRORS
+                ):
+                    self.error_log.report(
+                        f"aborting: {self.consecutive_monitor_errors} "
+                        f"consecutive monitor errors — this is a problem "
+                        f"with the monitoring host, not evidence of a "
+                        f"network outage"
+                    )
+                    exit_code = 1
+                    break
+                next_tick += config.ping_interval_seconds
+                delay = next_tick - time.monotonic()
+                if delay > 0:
+                    self.stop_event.wait(delay)
+                else:
+                    # We fell behind (e.g. suspend/resume). Re-anchor
+                    # instead of firing a burst of catch-up pings.
+                    next_tick = time.monotonic()
+        finally:
+            self.shutdown()
+        return exit_code
+
+    def _flush_pending(self, outage_id: str | None) -> None:
+        for pending in self.pending_failures:
+            pending["outage_id"] = outage_id
+            self.writer.write(pending)
+        self.pending_failures = []
+        self.pending_start = None
 
     def _record(self, timestamp: dt.datetime, outcome: PingOutcome) -> None:
         record = {
@@ -282,33 +317,61 @@ class Monitor:
             record["outage_id"] = self.outage_id
             self.consecutive_monitor_errors += 1
             self.error_log.report(outcome.error)
-        else:
-            self.consecutive_monitor_errors = 0
-            if outcome.success:
-                if self.outage_id is not None:
-                    self._close_outage()
-            else:
-                if self.outage_id is None:
-                    self._open_outage(timestamp)
-                record["outage_id"] = self.outage_id
-        self.writer.write(record)
+            self.writer.write(record)
+            return
+        self.consecutive_monitor_errors = 0
+        if outcome.success:
+            if self.outage_id is not None:
+                self._close_outage()
+            elif self.pending_failures:
+                # Recovered before the threshold: a blip, not an outage.
+                # The lost pings still land in the log (loss statistics),
+                # but with no outage_id and no traceroutes.
+                say(
+                    f"{timestamp.isoformat()} blip: "
+                    f"{len(self.pending_failures)} lost ping(s), recovered "
+                    f"before outage threshold "
+                    f"({self.config.outage_open_after_failures})"
+                )
+                self._flush_pending(None)
+            self.writer.write(record)
+            return
+        # Ping failure.  An already-open outage extends directly; otherwise
+        # buffer the record (at most threshold-1 entries, i.e. a couple of
+        # seconds) until enough consecutive failures confirm a real outage —
+        # then all buffered records join the event, which starts at the
+        # FIRST failed ping.
+        if self.outage_id is not None:
+            record["outage_id"] = self.outage_id
+            self.writer.write(record)
+            return
+        if self.pending_start is None:
+            self.pending_start = timestamp
+        self.pending_failures.append(record)
+        if len(self.pending_failures) >= self.config.outage_open_after_failures:
+            self._open_outage(self.pending_start)
+            self._flush_pending(self.outage_id)
 
     # -- shutdown ---------------------------------------------------------
     def shutdown(self) -> None:
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         if self.worker is not None:
-            print("netmon: waiting for in-flight on-failure actions...",
-                  flush=True)
+            say("netmon: waiting for in-flight on-failure actions...")
             self.worker.cleared.set()
             self.worker.join()
             self.worker = None
+        # Failures still short of the threshold at shutdown were never an
+        # outage; write them out as plain lost pings.
+        self._flush_pending(None)
         self.writer.close()
         with self.ip_lock:
             ips = set(self.seen_ips)
         if self.outage_count:
-            print(
+            say(
                 f"netmon: {self.outage_count} outage event(s) this run; "
-                f"{len(ips)} unique IP(s) seen in action output",
-                flush=True,
+                f"{len(ips)} unique IP(s) seen in action output"
             )
         if ips:
             # Post-run only: DNS/RDAP are unreachable during an outage, so
@@ -318,10 +381,11 @@ class Monitor:
                     ips,
                     self.config.ip_ownership_file,
                     rdap=self.config.rdap_lookups,
+                    log=say,
                 )
             except OSError as exc:
                 self.error_log.report(f"IP ownership lookup failed: {exc}")
-        print("netmon: shutdown complete", flush=True)
+        say("netmon: shutdown complete")
 
 
 def main() -> int:
@@ -341,10 +405,9 @@ def main() -> int:
     monitor = Monitor(config)
 
     def handle_signal(signum, _frame):
-        print(
+        say(
             f"netmon: received {signal.Signals(signum).name}, shutting down "
-            f"(will run IP ownership lookups first)...",
-            flush=True,
+            f"(will run IP ownership lookups first)..."
         )
         monitor.stop_event.set()
         # A second signal falls through to the default handler and kills us.

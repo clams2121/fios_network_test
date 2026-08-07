@@ -19,7 +19,7 @@ from netmon_ownership import _classify  # noqa: E402
 from visualize import monitoring_gaps, outage_spans  # noqa: E402
 
 
-def make_config(tmp: Path) -> Config:
+def make_config(tmp: Path, threshold: int = 1) -> Config:
     for sub in ("logs", "logs/traceroutes"):
         (tmp / sub).mkdir(parents=True, exist_ok=True)
     return Config(
@@ -28,6 +28,7 @@ def make_config(tmp: Path) -> Config:
         ping_interval_seconds=1.0,
         ping_timeout_seconds=1.0,
         traceroute_interval_seconds=0.05,
+        outage_open_after_failures=threshold,
         log_dir=tmp / "logs",
         traceroute_dir=tmp / "logs/traceroutes",
         ip_ownership_file=tmp / "logs/ip-ownership.jsonl",
@@ -83,6 +84,60 @@ class OutageLifecycleTest(unittest.TestCase):
             # Each outage produced its own event directory.
             event_dirs = sorted((tmp / "logs/traceroutes").iterdir())
             self.assertEqual(len(event_dirs), 2)
+
+    def test_threshold_blip_is_not_an_outage(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            monitor = Monitor(make_config(tmp, threshold=3))
+            t = dt.datetime(2026, 8, 6, 15, 0, 0).astimezone()
+            one = dt.timedelta(seconds=1)
+            # Two lost pings then recovery: below the threshold of 3.
+            monitor._record(t, PingOutcome(False))
+            monitor._record(t + one, PingOutcome(False))
+            self.assertIsNone(monitor.outage_id)
+            self.assertIsNone(monitor.worker)
+            monitor._record(t + 2 * one, PingOutcome(True, latency_ms=9.0))
+            monitor.shutdown()
+            records = [
+                json.loads(line)
+                for line in (tmp / "logs" / f"ping-{dt.date.today()}.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            self.assertEqual(
+                [r["success"] for r in records], [False, False, True]
+            )
+            self.assertEqual([r["outage_id"] for r in records], [None] * 3)
+            self.assertEqual(monitor.outage_count, 0)
+            self.assertEqual(list((tmp / "logs/traceroutes").iterdir()), [])
+
+    def test_threshold_outage_starts_at_first_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            monitor = Monitor(make_config(tmp, threshold=3))
+            t = dt.datetime(2026, 8, 6, 15, 0, 0).astimezone()
+            one = dt.timedelta(seconds=1)
+            monitor._record(t, PingOutcome(False))
+            monitor._record(t + one, PingOutcome(False))
+            self.assertIsNone(monitor.outage_id)
+            monitor._record(t + 2 * one, PingOutcome(False))
+            # Third consecutive failure confirms the outage, named for the
+            # FIRST failed ping's timestamp.
+            self.assertEqual(monitor.outage_id, t.strftime("%Y-%m-%dT%H-%M-%S"))
+            monitor._record(t + 3 * one, PingOutcome(True, latency_ms=9.0))
+            monitor.shutdown()
+            records = [
+                json.loads(line)
+                for line in (tmp / "logs" / f"ping-{dt.date.today()}.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            # All three buffered failures were written with the event id.
+            self.assertEqual(
+                [r["outage_id"] is not None for r in records],
+                [True, True, True, False],
+            )
+            self.assertEqual(monitor.outage_count, 1)
 
     def test_monitor_error_does_not_open_outage(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -143,6 +198,7 @@ traceroute_target_ip = "1.1.1.1"
 ping_interval_seconds = 1.0
 ping_timeout_seconds = 1.0
 traceroute_interval_seconds = 10.0
+outage_open_after_failures = 3
 log_dir = "logs"
 traceroute_dir = "logs/traceroutes"
 ip_ownership_file = "logs/ip-ownership.jsonl"

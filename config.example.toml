@@ -21,6 +21,13 @@ ping_interval_seconds = 1.0        # fixed cadence between pings
 ping_timeout_seconds = 1.0         # a ping unanswered this long is a failure
 traceroute_interval_seconds = 10.0 # gap between action cycles during an outage
 
+# Consecutive failed pings before an outage event opens (and traceroutes
+# start).  Filters routine single-packet loss out of the event record; every
+# lost ping is still logged either way.  Once confirmed, the event's start
+# time is the FIRST failed ping of the run.  Set to 1 to open an event on
+# any lost ping.
+outage_open_after_failures = 3
+
 log_dir = "logs"                          # daily ping-YYYY-MM-DD.jsonl + monitor-errors.log
 traceroute_dir = "logs/traceroutes"       # one traceroute-<start>/ dir per outage event
 ip_ownership_file = "logs/ip-ownership.jsonl"
