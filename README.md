@@ -42,11 +42,15 @@ problem — they are never counted as network failures.
 ## Installation (Ubuntu)
 
 ```bash
-sudo apt install traceroute            # ping ships with Ubuntu (iputils)
-pip install matplotlib                 # only needed for visualize.py
 git clone <this repo> && cd fios_network_test
-cp config.example.toml config.toml     # then edit it
+sudo apt install traceroute python3-matplotlib   # ping ships with Ubuntu
+cp config.example.toml config.toml               # then edit it
 ```
+
+(`python3-matplotlib` comes from apt rather than pip because Ubuntu 23.04+
+marks the system Python as externally managed, so a bare `pip install`
+fails; the apt package sidesteps that and is only needed for
+`visualize.py`. If you prefer pip, use a virtualenv.)
 
 Requires Python 3.11+ (Ubuntu 23.04 or newer; Ubuntu 24.04 LTS ships
 3.12). Python 3.11 is what makes the standard-library TOML parser
@@ -109,6 +113,23 @@ sudo systemctl stop netmon       # clean shutdown (runs ownership lookups)
 
 The unit sets `TimeoutStopSec=180` so systemd gives the post-run lookups
 time to finish before escalating to SIGKILL.
+
+### Updating / redeploying
+
+```bash
+./deploy.sh                    # pull latest code, refresh dependencies,
+                               # validate config, run tests, restart service
+./deploy.sh --install-service  # first-time setup: additionally generates
+                               # the systemd unit with this checkout's
+                               # paths and your user, enables and starts it
+```
+
+The script is deliberately cautious: it stops before touching the service
+if the pull, the dependency install, the config validation, or the test
+suite fails, so a working monitor keeps running. The restart itself is a
+clean shutdown (in-flight traceroutes finish, IP ownership lookups run),
+so it can take a minute. Without an installed service it just tells you
+how to run the monitor in the foreground.
 
 ## Generating the chart
 

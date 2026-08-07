@@ -394,6 +394,12 @@ def main() -> int:
         "traceroutes."
     )
     parser.add_argument("--config", required=True, help="path to config.toml")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="validate the config (keys, IPs, binaries, directories) and "
+        "exit without monitoring",
+    )
     args = parser.parse_args()
 
     try:
@@ -401,6 +407,16 @@ def main() -> int:
     except ConfigError as exc:
         print(f"CONFIG ERROR: {exc}", file=sys.stderr)
         return 2
+
+    if args.check:
+        print(
+            f"config OK: ping {config.ping_target_ip} every "
+            f"{config.ping_interval_seconds}s; outage after "
+            f"{config.outage_open_after_failures} consecutive failures; "
+            f"traceroute {config.traceroute_target_ip} every "
+            f"{config.traceroute_interval_seconds}s; logs in {config.log_dir}"
+        )
+        return 0
 
     monitor = Monitor(config)
 
