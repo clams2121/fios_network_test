@@ -1,0 +1,34 @@
+# Systemd unit for the network connectivity monitor.
+#
+# Install (adjust paths to where you cloned the repo):
+#   sudo cp systemd/netmon.service /etc/systemd/system/netmon.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now netmon
+#
+# Follow the live log:   journalctl -u netmon -f
+# Stop (clean shutdown, runs the IP ownership lookups):  sudo systemctl stop netmon
+
+[Unit]
+Description=Network connectivity monitor (ping + on-failure traceroute)
+# Start only once the network stack is up, and keep restarting if the
+# monitor itself hits a fatal error.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+# EDIT these two paths to your checkout location.
+WorkingDirectory=/opt/netmon
+ExecStart=/usr/bin/python3 /opt/netmon/netmon.py --config /opt/netmon/config.toml
+Restart=on-failure
+RestartSec=10
+# Clean shutdown is SIGTERM (systemd's default).  The monitor then finishes
+# any in-flight traceroute and runs the post-run IP ownership lookups, so
+# give it time before systemd escalates to SIGKILL.
+TimeoutStopSec=180
+# Run as a regular user; 'ping' and 'traceroute' on Ubuntu work unprivileged.
+User=netmon
+Group=netmon
+
+[Install]
+WantedBy=multi-user.target

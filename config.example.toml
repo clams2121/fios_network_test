@@ -1,0 +1,66 @@
+# Network connectivity monitor configuration.
+#
+# Copy to config.toml and edit.  Every key shown here is REQUIRED: the
+# monitor validates the file at startup and refuses to run on a missing or
+# malformed key — there are no silent defaults.
+#
+# Relative paths are resolved relative to this file's directory, so the
+# monitor behaves the same no matter where it is launched from (including
+# under systemd).
+
+# The IP pinged once per ping_interval_seconds.  Pick a stable anycast
+# address outside Verizon's network, e.g. 8.8.8.8 (Google) or 1.1.1.1
+# (Cloudflare).
+ping_target_ip = "8.8.8.8"
+
+# The IP traced on failure.  Deliberately separate from the ping target so
+# a problem specific to one destination network doesn't blind both probes.
+traceroute_target_ip = "1.1.1.1"
+
+ping_interval_seconds = 1.0        # fixed cadence between pings
+ping_timeout_seconds = 1.0         # a ping unanswered this long is a failure
+traceroute_interval_seconds = 10.0 # gap between action cycles during an outage
+
+# Consecutive failed pings before an outage event opens (and traceroutes
+# start).  Filters routine single-packet loss out of the event record; every
+# lost ping is still logged either way.  Once confirmed, the event's start
+# time is the FIRST failed ping of the run.  Set to 1 to open an event on
+# any lost ping.
+outage_open_after_failures = 3
+
+log_dir = "logs"                          # daily ping-YYYY-MM-DD.jsonl + monitor-errors.log
+traceroute_dir = "logs/traceroutes"       # one traceroute-<start>/ dir per outage event
+ip_ownership_file = "logs/ip-ownership.jsonl"
+
+# Set to false to skip the post-run RDAP (WHOIS) org lookups; reverse-DNS
+# PTR lookups still run.  RDAP queries go to https://rdap.org, which
+# redirects to the authoritative regional registry.
+rdap_lookups = true
+
+# ---------------------------------------------------------------------------
+# On-failure actions.  Every entry runs once at the start of an outage event
+# and then once per traceroute_interval_seconds until connectivity returns.
+# Each run writes one timestamped file into the event's directory.
+#
+#   type = "traceroute"  appends traceroute_target_ip to the command
+#   type = "command"     runs the command verbatim and captures its output
+#
+# 'name' (optional for the first traceroute) is used in output file names
+# and must be unique per entry.
+
+[[on_failure_actions]]
+type = "traceroute"
+name = "traceroute"
+# -n : numeric output.  DNS is typically unreachable during an outage, so
+#      resolving hop names inline would stall each probe and pollute the
+#      evidence; names are attached afterwards via the ip-ownership file.
+# -q 2 : two probes per hop keeps each traceroute comfortably inside the
+#      10-second cycle even when many hops time out.
+# -w 2 : wait at most 2 s per probe.
+command = ["traceroute", "-n", "-q", "2", "-w", "2"]
+
+# Example of a future add-on check (uncomment and adjust):
+# [[on_failure_actions]]
+# type = "command"
+# name = "dns-check"
+# command = ["dig", "+time=2", "+tries=1", "@8.8.8.8", "example.com"]
