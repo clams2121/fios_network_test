@@ -16,7 +16,8 @@ from netmon import Monitor, PingOutcome, _LATENCY_RE  # noqa: E402
 from netmon_actions import extract_ips  # noqa: E402
 from netmon_config import ActionConfig, Config, ConfigError, load_config  # noqa: E402
 from netmon_ownership import _classify  # noqa: E402
-from visualize import monitoring_gaps, outage_spans  # noqa: E402
+from netmon_web import Handler, Site  # noqa: E402
+from visualize import monitoring_gaps, outage_spans, summarize  # noqa: E402
 
 
 def make_config(tmp: Path, threshold: int = 1) -> Config:
@@ -32,7 +33,11 @@ def make_config(tmp: Path, threshold: int = 1) -> Config:
         log_dir=tmp / "logs",
         traceroute_dir=tmp / "logs/traceroutes",
         ip_ownership_file=tmp / "logs/ip-ownership.jsonl",
+        chart_dir=tmp / "logs/charts",
         rdap_lookups=False,
+        web_bind_ip="127.0.0.1",
+        web_port=8477,
+        web_daily_chart_hour=1,
         # 'true' exits instantly with no output: a harmless stand-in action.
         on_failure_actions=[
             ActionConfig(type="command", name="noop", command=["true"])
@@ -199,6 +204,10 @@ ping_interval_seconds = 1.0
 ping_timeout_seconds = 1.0
 traceroute_interval_seconds = 10.0
 outage_open_after_failures = 3
+web_bind_ip = "127.0.0.1"
+web_port = 8477
+web_daily_chart_hour = 1
+chart_dir = "logs/charts"
 log_dir = "logs"
 traceroute_dir = "logs/traceroutes"
 ip_ownership_file = "logs/ip-ownership.jsonl"
@@ -261,6 +270,154 @@ class VisualizeTest(unittest.TestCase):
         gaps = monitoring_gaps(records, 1.0)
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0], (records[3]["ts"], records[4]["ts"]))
+
+
+class WebTest(unittest.TestCase):
+    """The web layer, exercised without opening a socket."""
+
+    def _seed(self, tmp: Path, day: dt.date) -> Site:
+        config = make_config(tmp, threshold=3)
+        tz = dt.timezone(dt.timedelta(hours=-4))
+        t = dt.datetime(day.year, day.month, day.day, 12, 0, 0, tzinfo=tz)
+        lines = []
+        for i in range(10):
+            failed = 3 <= i < 6
+            lines.append(json.dumps({
+                "ts": (t + dt.timedelta(seconds=i)).isoformat(),
+                "target": "8.8.8.8",
+                "success": not failed,
+                "latency_ms": None if failed else 10.0,
+                "outage_id": "EVT1" if failed else None,
+            }))
+        (config.log_dir / f"ping-{day.isoformat()}.jsonl").write_text(
+            "\n".join(lines) + "\n"
+        )
+        event = config.traceroute_dir / "traceroute-EVT1"
+        event.mkdir(parents=True, exist_ok=True)
+        (event / "traceroute-x.txt").write_text(
+            "# action: traceroute\n 1  192.168.1.1  0.5 ms\n"
+            " 2  100.41.135.2  4.2 ms\n"
+        )
+        config.ip_ownership_file.write_text(
+            json.dumps({
+                "ip": "100.41.135.2",
+                "ptr": "verizon-gni.net",
+                "special": None,
+                "rdap": {"org": "Verizon Business"},
+                "error": None,
+            }) + "\n"
+        )
+        return Site(config)
+
+    def test_day_listing_stats_and_page(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            day = dt.date(2026, 8, 5)
+            site = self._seed(tmp, day)
+            self.assertEqual(site.available_days(), [day])
+            stats = site.day_stats(day)
+            self.assertEqual(stats["pings"], 10)
+            self.assertEqual(stats["failures"], 3)
+            self.assertEqual(stats["outage_count"], 1)
+            page = site.day_page(day).decode()
+            # Outage detail and the joined ownership are both present.
+            self.assertIn("Outage events", page)
+            self.assertIn("100.41.135.2", page)
+            self.assertIn("Verizon Business", page)
+            self.assertIn("traceroute-x.txt", page)
+            # The generate button always targets today, never the day shown.
+            self.assertIn(
+                f"value='{dt.date.today().isoformat()}'", page
+            )
+            self.assertNotIn(f"value='{day.isoformat()}'", page)
+
+    def test_empty_state_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            site = Site(make_config(Path(tmpdir)))
+            self.assertEqual(site.available_days(), [])
+            self.assertIn(b"No ping logs found", site.index())
+
+    def test_generate_reports_missing_data_as_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            site = Site(make_config(Path(tmpdir)))
+            ok, message = site.generate(dt.date(2026, 1, 1))
+            self.assertFalse(ok)
+            self.assertIn("No ping data", message)
+
+    def test_html_escaping_of_untrusted_disk_content(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            day = dt.date(2026, 8, 5)
+            site = self._seed(tmp, day)
+            site.config.ip_ownership_file.write_text(
+                json.dumps({
+                    "ip": "100.41.135.2",
+                    "ptr": "<script>alert(1)</script>",
+                    "special": None, "rdap": None, "error": None,
+                }) + "\n"
+            )
+            page = site.day_page(day).decode()
+            self.assertNotIn("<script>alert(1)</script>", page)
+            self.assertIn("&lt;script&gt;", page)
+
+
+class PathSafetyTest(unittest.TestCase):
+    """_safe_child must confine every served path to its base directory."""
+
+    def setUp(self):
+        self.handler = Handler.__new__(Handler)  # no socket needed
+
+    def test_rejects_traversal_and_separators(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir) / "base"
+            (base / "evt").mkdir(parents=True)
+            (base / "evt" / "ok.txt").write_text("fine")
+            (Path(tmpdir) / "secret.txt").write_text("secret")
+            for parts in (
+                ("..", "secret.txt"),
+                ("evt", ".."),
+                ("evt/../..", "secret.txt"),
+                ("", "ok.txt"),
+                ("evt", "sub/ok.txt"),
+                ("evt", "..\\ok.txt"),
+            ):
+                self.assertIsNone(
+                    self.handler._safe_child(base, *parts), f"allowed {parts}"
+                )
+            self.assertIsNotNone(
+                self.handler._safe_child(base, "evt", "ok.txt")
+            )
+
+    def test_parse_day_rejects_non_dates(self):
+        for bad in ("../../etc/passwd", "2026-8-5", "", "2026-13-01",
+                    "2026-08-05/x", "abcd-ef-gh"):
+            self.assertIsNone(self.handler._parse_day(bad), f"allowed {bad}")
+        self.assertEqual(
+            self.handler._parse_day("2026-08-05"), dt.date(2026, 8, 5)
+        )
+
+
+class SchedulerTest(unittest.TestCase):
+    def test_next_run_is_the_configured_hour(self):
+        from netmon_web import DailyChartScheduler
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sched = DailyChartScheduler(Site(make_config(Path(tmpdir))), 1)
+            # Before 1 AM -> today at 01:00.
+            self.assertEqual(
+                sched._next_run(dt.datetime(2026, 8, 6, 0, 30)),
+                dt.datetime(2026, 8, 6, 1, 0),
+            )
+            # After 1 AM -> tomorrow at 01:00.
+            self.assertEqual(
+                sched._next_run(dt.datetime(2026, 8, 6, 9, 0)),
+                dt.datetime(2026, 8, 7, 1, 0),
+            )
+            # Exactly 1 AM -> tomorrow (never fires twice for one day).
+            self.assertEqual(
+                sched._next_run(dt.datetime(2026, 8, 6, 1, 0)),
+                dt.datetime(2026, 8, 7, 1, 0),
+            )
 
 
 if __name__ == "__main__":

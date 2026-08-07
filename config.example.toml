@@ -31,11 +31,29 @@ outage_open_after_failures = 3
 log_dir = "logs"                          # daily ping-YYYY-MM-DD.jsonl + monitor-errors.log
 traceroute_dir = "logs/traceroutes"       # one traceroute-<start>/ dir per outage event
 ip_ownership_file = "logs/ip-ownership.jsonl"
+chart_dir = "logs/charts"                 # daily connection-YYYY-MM-DD.png charts
 
 # Set to false to skip the post-run RDAP (WHOIS) org lookups; reverse-DNS
 # PTR lookups still run.  RDAP queries go to https://rdap.org, which
 # redirects to the authoritative regional registry.
 rdap_lookups = true
+
+# ---------------------------------------------------------------------------
+# Web UI (netmon_web.py) — browse daily charts and outage evidence.
+#
+# The server binds ONLY to this address.  There is no authentication, so
+# the bind address IS the access control:
+#   "127.0.0.1"  reachable only from this machine (safest; use an SSH
+#                tunnel to view it remotely)
+#   "192.168.x.y" this machine's LAN address — reachable by anything on
+#                your LAN.  Never bind an internet-facing address.
+web_bind_ip = "127.0.0.1"
+web_port = 8477
+
+# Hour (local, 0-23) at which the web server renders the chart for the day
+# that just ended.  Days with logs but no chart are also backfilled when
+# the server starts.
+web_daily_chart_hour = 1
 
 # ---------------------------------------------------------------------------
 # On-failure actions.  Every entry runs once at the start of an outage event

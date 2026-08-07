@@ -13,7 +13,9 @@
 
 set -euo pipefail
 
-SERVICE=netmon
+# Both units are installed and restarted together: the monitor collects
+# the evidence, the web UI serves it.
+SERVICES=(netmon netmon-web)
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
@@ -59,43 +61,67 @@ echo "==> Running tests..."
 python3 -m unittest discover -s tests
 
 service_installed() {
-    systemctl cat "$SERVICE.service" >/dev/null 2>&1
+    systemctl cat "$1.service" >/dev/null 2>&1
 }
 
 if [[ $INSTALL_SERVICE -eq 1 ]]; then
-    echo "==> Installing systemd unit for $REPO_DIR..."
+    echo "==> Installing systemd units for $REPO_DIR..."
     if ! command -v systemctl >/dev/null; then
         echo "ERROR: systemctl not found; is this a systemd system?" >&2
         exit 2
     fi
-    # Run the service as the invoking (non-root) user.
+    # Run the services as the invoking (non-root) user.
     RUN_USER="${SUDO_USER:-$(id -un)}"
     RUN_GROUP="$(id -gn "$RUN_USER")"
-    sed -e "s|/opt/netmon|$REPO_DIR|g" \
-        -e "s|^User=.*|User=$RUN_USER|" \
-        -e "s|^Group=.*|Group=$RUN_GROUP|" \
-        systemd/netmon.service | $SUDO tee "/etc/systemd/system/$SERVICE.service" >/dev/null
+    for svc in "${SERVICES[@]}"; do
+        sed -e "s|/opt/netmon|$REPO_DIR|g" \
+            -e "s|^User=.*|User=$RUN_USER|" \
+            -e "s|^Group=.*|Group=$RUN_GROUP|" \
+            "systemd/$svc.service" \
+            | $SUDO tee "/etc/systemd/system/$svc.service" >/dev/null
+        echo "    installed $svc.service"
+    done
     $SUDO systemctl daemon-reload
-    $SUDO systemctl enable "$SERVICE"
+    $SUDO systemctl enable "${SERVICES[@]}"
 fi
 
-if service_installed; then
-    echo "==> Restarting $SERVICE (clean shutdown first: finishes in-flight"
-    echo "    traceroutes and runs IP ownership lookups; can take a minute)..."
-    $SUDO systemctl restart "$SERVICE"
-    sleep 2
-    if systemctl is-active --quiet "$SERVICE"; then
-        echo "==> $SERVICE is running."
-        $SUDO journalctl -u "$SERVICE" -n 3 --no-pager || true
+ANY_INSTALLED=0
+for svc in "${SERVICES[@]}"; do
+    service_installed "$svc" || continue
+    ANY_INSTALLED=1
+    if [[ "$svc" == "netmon" ]]; then
+        echo "==> Restarting $svc (clean shutdown first: finishes in-flight"
+        echo "    traceroutes and runs IP ownership lookups; can take a minute)..."
     else
-        echo "ERROR: $SERVICE failed to start. Recent log:" >&2
-        $SUDO journalctl -u "$SERVICE" -n 20 --no-pager >&2 || true
+        echo "==> Restarting $svc..."
+    fi
+    $SUDO systemctl restart "$svc"
+    sleep 2
+    if systemctl is-active --quiet "$svc"; then
+        echo "==> $svc is running."
+        $SUDO journalctl -u "$svc" -n 3 --no-pager || true
+    else
+        echo "ERROR: $svc failed to start. Recent log:" >&2
+        $SUDO journalctl -u "$svc" -n 20 --no-pager >&2 || true
         exit 1
     fi
-else
-    echo "==> No systemd unit installed for $SERVICE."
+done
+
+if [[ $ANY_INSTALLED -eq 0 ]]; then
+    echo "==> No systemd units installed yet."
     echo "    First-time setup:  ./deploy.sh --install-service"
-    echo "    Or run in the foreground:  python3 netmon.py --config config.toml"
+    echo "    Or run in the foreground:"
+    echo "      python3 netmon.py --config config.toml"
+    echo "      python3 netmon_web.py --config config.toml"
+else
+    WEB_IP=$(python3 - <<'PY'
+from netmon_config import load_config
+c = load_config("config.toml", prepare_dirs=False)
+host = f"[{c.web_bind_ip}]" if ":" in c.web_bind_ip else c.web_bind_ip
+print(f"http://{host}:{c.web_port}/")
+PY
+)
+    echo "==> Web UI: $WEB_IP"
 fi
 
 echo "==> Deploy complete."

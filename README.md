@@ -20,6 +20,9 @@ logs/
                                  mixed into the network evidence)
   ip-ownership.jsonl             one record per unique IP seen in any
                                  traceroute: PTR name + RDAP org
+  charts/
+    connection-2026-08-06.png    one chart per day, rendered nightly by
+    connection-2026-08-07.png    the web UI (or on demand)
   traceroutes/
     traceroute-2026-08-06T14-23-07/     one directory per outage event,
       traceroute-2026-08-06T14-23-07.txt   named for the event start;
@@ -109,9 +112,10 @@ no `nohup` needed. The easy way is the deploy script:
 ./deploy.sh --install-service
 ```
 
-That generates the unit from `systemd/netmon.service` with this
-checkout's real paths and your user, installs it to
-`/etc/systemd/system/netmon.service`, enables it, and starts it.
+That generates both units (`systemd/netmon.service` and
+`systemd/netmon-web.service`) with this checkout's real paths and your
+user, installs them to `/etc/systemd/system/`, enables them, and starts
+them.
 Compared to `nohup`/backgrounding, systemd gives you the three things a
 monitor actually needs:
 
@@ -120,22 +124,28 @@ monitor actually needs:
   box doesn't silently end evidence collection;
 * `Restart=on-failure` brings it back automatically if it ever aborts.
 
-If you'd rather install by hand: edit the two paths in
-`systemd/netmon.service`, then
-`sudo cp systemd/netmon.service /etc/systemd/system/ &&
-sudo systemctl daemon-reload && sudo systemctl enable --now netmon`.
+If you'd rather install by hand: edit the paths in
+`systemd/netmon.service` and `systemd/netmon-web.service`, then
+`sudo cp systemd/netmon*.service /etc/systemd/system/ &&
+sudo systemctl daemon-reload &&
+sudo systemctl enable --now netmon netmon-web`.
 
 If you had previously started the monitor manually in a terminal, stop
 that one first so two monitors aren't pinging at once.
 
 ### Day-to-day management
 
+There are two services: `netmon` (collects the evidence) and
+`netmon-web` (serves the charts). They are independent — restarting the
+web UI never interrupts monitoring.
+
 ```bash
-systemctl status netmon          # is it running?
-journalctl -u netmon -f          # watch the live log (outage starts/ends, blips)
-sudo systemctl restart netmon    # restart (rarely needed; deploy.sh does this)
-sudo systemctl stop netmon       # clean shutdown — runs the IP ownership lookups
-sudo systemctl start netmon      # start again after a stop
+systemctl status netmon netmon-web   # are they running?
+journalctl -u netmon -f              # live monitor log (outage starts/ends, blips)
+journalctl -u netmon-web -f          # live web log (chart renders, requests)
+sudo systemctl restart netmon        # restart (rarely needed; deploy.sh does this)
+sudo systemctl stop netmon           # clean shutdown — runs the IP ownership lookups
+sudo systemctl start netmon          # start again after a stop
 ```
 
 Stopping (and restarting) is always a *clean* shutdown: in-flight
@@ -184,6 +194,53 @@ Evidence-integrity details, all visible in the legend:
   lighter **max envelope** is drawn as well so short latency spikes are
   not averaged out of sight. Outage spans and loss statistics are always
   computed from the raw records, never from the downsampled series.
+
+## Web UI
+
+A small local web server (standard library only) for browsing the
+evidence day by day:
+
+```bash
+python3 netmon_web.py --config config.toml
+```
+
+It is normally run as a service — `./deploy.sh --install-service`
+installs it alongside the monitor — and offers:
+
+* **a sidebar of every day** that has ping logs, each with a badge
+  showing that day's outage count;
+* **that day's chart**, plus the headline stats (pings, loss rate,
+  outages, downtime, longest outage);
+* **a "Generate today's chart" button** — today is the only day still
+  accumulating data, so it is the only one worth regenerating on demand;
+* **per-outage detail**: each event's start, duration, the hop IPs seen
+  in its traceroutes joined against `ip-ownership.jsonl` (so you can see
+  where it broke — your router, Verizon, or beyond), and links to the raw
+  capture files.
+
+### Daily charts
+
+The web server renders the chart for the day that just ended at
+`web_daily_chart_hour` (1 AM by default). It also **backfills on
+startup**: any day that has logs but no chart is rendered when the
+service starts, so charts are never permanently missed because the
+server was down overnight.
+
+### Access and security
+
+The server binds **only** to `web_bind_ip`, and that bind address is the
+entire access-control model — there is no authentication:
+
+| `web_bind_ip` | Who can reach it |
+|---|---|
+| `127.0.0.1` | only this machine (use `ssh -L 8477:127.0.0.1:8477 host` to view remotely) |
+| your LAN address, e.g. `192.168.1.50` | anything on your LAN |
+
+Do not bind it to an internet-facing address. Apart from the regenerate
+button the UI is read-only, it serves only files inside the configured
+log/chart/traceroute directories (path traversal is rejected), and the
+web server runs as its own service — restarting or crashing it never
+interrupts the monitor's data collection.
 
 ## How outage response works
 
@@ -272,5 +329,8 @@ python3 -m unittest discover -s tests -v
 ```
 
 Standard-library `unittest` only. Covers outage open/group/close
-semantics, the monitor-error separation, config validation, ping output
-parsing, IP extraction, and the chart's outage-span/gap reconstruction.
+semantics, the blip threshold, the monitor-error separation, config
+validation, ping output parsing, IP extraction, the chart's
+outage-span/gap reconstruction, and the web layer — page rendering,
+HTML escaping of on-disk content, path-traversal rejection, and the
+daily scheduler's next-run arithmetic.
