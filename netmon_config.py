@@ -54,7 +54,11 @@ class Config:
     log_dir: Path
     traceroute_dir: Path
     ip_ownership_file: Path
+    chart_dir: Path
     rdap_lookups: bool
+    web_bind_ip: str
+    web_port: int
+    web_daily_chart_hour: int
     on_failure_actions: list[ActionConfig]
 
 
@@ -94,6 +98,25 @@ def _require_positive_int(raw: dict, key: str) -> int:
     value = _require(raw, key, int, "integer")
     if value < 1:
         raise ConfigError(f"'{key}' must be >= 1, got {value}")
+    return value
+
+
+def _require_port(raw: dict, key: str) -> int:
+    value = _require(raw, key, int, "integer")
+    if not 1 <= value <= 65535:
+        raise ConfigError(f"'{key}' must be a port in 1-65535, got {value}")
+    if value < 1024:
+        raise ConfigError(
+            f"'{key}' is {value}: ports below 1024 need root, and the "
+            f"monitor is meant to run unprivileged. Pick a port >= 1024."
+        )
+    return value
+
+
+def _require_hour(raw: dict, key: str) -> int:
+    value = _require(raw, key, int, "integer")
+    if not 0 <= value <= 23:
+        raise ConfigError(f"'{key}' must be an hour in 0-23, got {value}")
     return value
 
 
@@ -197,7 +220,11 @@ def load_config(path: str | Path, *, prepare_dirs: bool = True) -> Config:
         log_dir=_path("log_dir"),
         traceroute_dir=_path("traceroute_dir"),
         ip_ownership_file=_path("ip_ownership_file"),
+        chart_dir=_path("chart_dir"),
         rdap_lookups=_require(raw, "rdap_lookups", bool, "boolean"),
+        web_bind_ip=_require_ip(raw, "web_bind_ip"),
+        web_port=_require_port(raw, "web_port"),
+        web_daily_chart_hour=_require_hour(raw, "web_daily_chart_hour"),
         on_failure_actions=actions,
     )
 
@@ -212,5 +239,6 @@ def load_config(path: str | Path, *, prepare_dirs: bool = True) -> Config:
         _prepare_dir(config.log_dir, "log_dir")
         _prepare_dir(config.traceroute_dir, "traceroute_dir")
         _prepare_dir(config.ip_ownership_file.parent, "ip_ownership_file")
+        _prepare_dir(config.chart_dir, "chart_dir")
 
     return config

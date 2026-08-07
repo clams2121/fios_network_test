@@ -1,0 +1,33 @@
+# Systemd unit for the network monitor's web UI.
+#
+# Installed automatically by ./deploy.sh --install-service, which fills in
+# the real paths and user. To install by hand, edit the paths below, then:
+#   sudo cp systemd/netmon-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now netmon-web
+#
+# Follow the log:  journalctl -u netmon-web -f
+#
+# This service only reads the evidence and renders charts; the monitor
+# (netmon.service) runs independently, so restarting the web UI never
+# interrupts data collection.
+
+[Unit]
+Description=Network connectivity monitor web UI (charts and outage evidence)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+# EDIT these two paths to your checkout location.
+WorkingDirectory=/opt/netmon
+ExecStart=/usr/bin/python3 /opt/netmon/netmon_web.py --config /opt/netmon/config.toml
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+# Run as a regular user; no privileged ports (web_port must be >= 1024).
+User=netmon
+Group=netmon
+
+[Install]
+WantedBy=multi-user.target

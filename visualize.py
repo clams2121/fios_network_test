@@ -111,12 +111,17 @@ def load_records(files: list[Path]) -> list[dict]:
     return records
 
 
-def outage_spans(
+def outage_events(
     records: list[dict], ping_interval: float
-) -> list[tuple[dt.datetime, dt.datetime]]:
-    """(start, end) per outage event, from the outage_id grouping.  An
-    outage that was still open at the end of the log closes one interval
-    after its last failed ping."""
+) -> list[dict]:
+    """One entry per outage event, grouped by outage_id, in time order.
+
+    An outage's end is one ping interval after its last failed ping (the
+    moment it was first known to still be down).  Blip failures — lost
+    pings that never reached the outage threshold — carry no outage_id
+    and are deliberately excluded here, though they still count toward
+    packet-loss statistics.
+    """
     spans: dict[str, list[dt.datetime]] = {}
     order: list[str] = []
     for record in records:
@@ -127,13 +132,29 @@ def outage_spans(
                 order.append(oid)
             else:
                 spans[oid][1] = record["ts"]
-    result = []
+    events = []
     for oid in order:
         start, last_fail = spans[oid]
-        result.append(
-            (start, last_fail + dt.timedelta(seconds=ping_interval))
+        end = last_fail + dt.timedelta(seconds=ping_interval)
+        events.append(
+            {
+                "outage_id": oid,
+                "start": start,
+                "end": end,
+                "seconds": (end - start).total_seconds(),
+            }
         )
-    return result
+    return events
+
+
+def outage_spans(
+    records: list[dict], ping_interval: float
+) -> list[tuple[dt.datetime, dt.datetime]]:
+    """(start, end) per outage event."""
+    return [
+        (event["start"], event["end"])
+        for event in outage_events(records, ping_interval)
+    ]
 
 
 def monitoring_gaps(
@@ -213,7 +234,53 @@ def fmt_duration(seconds: float) -> str:
     return f"{secs}s"
 
 
-def render(records: list[dict], outputs: list[Path]) -> None:
+def ping_interval_of(records: list[dict]) -> float:
+    """Median cadence taken from the data itself, so a non-default ping
+    interval still charts and summarises correctly."""
+    deltas = sorted(
+        (b["ts"] - a["ts"]).total_seconds()
+        for a, b in zip(records, records[1:])
+    )
+    return deltas[len(deltas) // 2] if deltas else 1.0
+
+
+def summarize(records: list[dict]) -> dict:
+    """Headline connection-health statistics for a set of ping records.
+
+    Shared by the chart and the web UI so both always report the same
+    numbers.  Outage spans come from the raw records, never from the
+    downsampled chart series.
+    """
+    ping_interval = ping_interval_of(records)
+    outages = outage_events(records, ping_interval)
+    total = sum(1 for r in records if r.get("success") is not None)
+    failures = sum(1 for r in records if r.get("success") is False)
+    downtime = sum(o["seconds"] for o in outages)
+    t_min, t_max = records[0]["ts"], records[-1]["ts"]
+    period_s = max((t_max - t_min).total_seconds(), 1.0)
+    return {
+        "ping_interval": ping_interval,
+        "target": records[0].get("target", "?"),
+        "first": t_min,
+        "last": t_max,
+        "period_seconds": period_s,
+        "pings": total,
+        "failures": failures,
+        "loss_fraction": (failures / total) if total else 0.0,
+        "outages": outages,
+        "outage_count": len(outages),
+        "downtime_seconds": downtime,
+        "downtime_fraction": downtime / period_s,
+        "longest": max(outages, key=lambda o: o["seconds"]) if outages else None,
+        "monitor_errors": sum(1 for r in records if r.get("success") is None),
+        "gaps": monitoring_gaps(records, ping_interval),
+    }
+
+
+def render(
+    records: list[dict], outputs: list[Path], *, quiet: bool = False
+) -> dict:
+    """Draw the chart to every path in *outputs*; returns the summary."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -221,16 +288,10 @@ def render(records: list[dict], outputs: list[Path]) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
-    # Median cadence from the data itself, so a non-default interval still
-    # charts correctly.
-    deltas = sorted(
-        (b["ts"] - a["ts"]).total_seconds()
-        for a, b in zip(records, records[1:])
-    )
-    ping_interval = deltas[len(deltas) // 2] if deltas else 1.0
-
-    spans = outage_spans(records, ping_interval)
-    gaps = monitoring_gaps(records, ping_interval)
+    stats = summarize(records)
+    ping_interval = stats["ping_interval"]
+    spans = [(o["start"], o["end"]) for o in stats["outages"]]
+    gaps = stats["gaps"]
     times, means, maxes, downsample_note, spacing = bucket_latency(records)
     monitor_errors = [r for r in records if r.get("success") is None]
 
@@ -242,13 +303,12 @@ def render(records: list[dict], outputs: list[Path]) -> None:
     def local(t: dt.datetime) -> dt.datetime:
         return t.astimezone(tz).replace(tzinfo=None)
 
-    total = sum(1 for r in records if r.get("success") is not None)
-    failures = sum(1 for r in records if r.get("success") is False)
-    downtime = sum((e - s).total_seconds() for s, e in spans)
-    longest = max(spans, key=lambda se: se[1] - se[0]) if spans else None
-
-    t_min, t_max = records[0]["ts"], records[-1]["ts"]
-    period_s = max((t_max - t_min).total_seconds(), 1.0)
+    total = stats["pings"]
+    failures = stats["failures"]
+    downtime = stats["downtime_seconds"]
+    longest = stats["longest"]
+    t_min, t_max = stats["first"], stats["last"]
+    period_s = stats["period_seconds"]
 
     fig, ax = plt.subplots(figsize=(13, 5.5), dpi=150)
     fig.patch.set_facecolor(SURFACE)
@@ -316,8 +376,8 @@ def render(records: list[dict], outputs: list[Path]) -> None:
     )
     if longest:
         subtitle += (
-            f"   |   longest: {fmt_duration((longest[1] - longest[0]).total_seconds())}"
-            f" at {longest[0]:%Y-%m-%d %H:%M:%S}"
+            f"   |   longest: {fmt_duration(longest['seconds'])}"
+            f" at {longest['start']:%Y-%m-%d %H:%M:%S}"
         )
     fig.suptitle(title, x=0.06, ha="left", fontsize=13,
                  color=INK_PRIMARY, fontweight="bold")
@@ -358,23 +418,53 @@ def render(records: list[dict], outputs: list[Path]) -> None:
         text.set_color(INK_SECONDARY)
 
     fig.tight_layout(rect=(0, 0.04, 1, 0.94))
-    for path in outputs:
-        fig.savefig(path, facecolor=SURFACE)
-        print(f"wrote {path}")
+    try:
+        for path in outputs:
+            # Write to a temporary file in the same directory and rename
+            # into place, so a reader (the web server) can never serve a
+            # half-written PNG.
+            tmp = path.with_name(f".{path.name}.tmp{path.suffix}")
+            fig.savefig(tmp, facecolor=SURFACE)
+            tmp.replace(path)
+            if not quiet:
+                print(f"wrote {path}")
+    finally:
+        plt.close(fig)  # a long-lived server must not leak figures
+    return stats
 
-    # Text summary mirrors the chart so it can be pasted into the email body.
+
+def print_summary(stats: dict) -> None:
+    """Text summary mirroring the chart, for pasting into an email body."""
     print()
-    print(f"Period:        {t_min:%Y-%m-%d %H:%M} .. {t_max:%Y-%m-%d %H:%M}")
-    print(f"Pings:         {total:,} ({failures:,} lost, {failures / total:.2%})")
-    print(f"Outages:       {len(spans)}")
-    print(f"Downtime:      {fmt_duration(downtime)} "
-          f"({downtime / period_s:.3%} of period)")
-    if longest:
-        print(f"Longest:       {fmt_duration((longest[1] - longest[0]).total_seconds())} "
-              f"starting {longest[0]:%Y-%m-%d %H:%M:%S}")
-    if monitor_errors:
-        print(f"Monitor errors: {len(monitor_errors)} "
+    print(f"Period:        {stats['first']:%Y-%m-%d %H:%M} .. "
+          f"{stats['last']:%Y-%m-%d %H:%M}")
+    print(f"Pings:         {stats['pings']:,} ({stats['failures']:,} lost, "
+          f"{stats['loss_fraction']:.2%})")
+    print(f"Outages:       {stats['outage_count']}")
+    print(f"Downtime:      {fmt_duration(stats['downtime_seconds'])} "
+          f"({stats['downtime_fraction']:.3%} of period)")
+    if stats["longest"]:
+        print(f"Longest:       {fmt_duration(stats['longest']['seconds'])} "
+              f"starting {stats['longest']['start']:%Y-%m-%d %H:%M:%S}")
+    if stats["monitor_errors"]:
+        print(f"Monitor errors: {stats['monitor_errors']} "
               f"(tool problems, excluded from outage statistics)")
+
+
+def render_day(log_dir: Path, day: dt.date, chart_dir: Path) -> dict | None:
+    """Render one day's chart into *chart_dir*.  Returns the summary, or
+    None if that day has no usable records.  Used by the web server's
+    button and its 1 AM scheduler."""
+    files = find_log_files(log_dir, day, day)
+    if not files:
+        return None
+    records = load_records(files)
+    if not records:
+        return None
+    chart_dir.mkdir(parents=True, exist_ok=True)
+    return render(
+        records, [chart_dir / f"connection-{day.isoformat()}.png"], quiet=True
+    )
 
 
 def main() -> int:
@@ -418,7 +508,7 @@ def main() -> int:
             print(f"ERROR: unsupported output format: {path} (use .png/.pdf)",
                   file=sys.stderr)
             return 2
-    render(records, outputs)
+    print_summary(render(records, outputs))
     return 0
 
 
