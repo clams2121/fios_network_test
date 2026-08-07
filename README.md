@@ -42,7 +42,8 @@ problem — they are never counted as network failures.
 ## Installation (Ubuntu)
 
 ```bash
-git clone <this repo> && cd fios_network_test
+git clone https://github.com/clams2121/fios_network_test.git
+cd fios_network_test
 sudo apt install traceroute python3-matplotlib   # ping ships with Ubuntu
 cp config.example.toml config.toml               # then edit it
 ```
