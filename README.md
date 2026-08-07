@@ -101,18 +101,47 @@ python3 netmon_ownership.py --config config.toml --rescan
 
 ### Running persistently (systemd)
 
-`systemd/netmon.service` is included. Adjust the two paths inside it, then:
+To have the monitor run all the time, install it as a systemd service —
+no `nohup` needed. The easy way is the deploy script:
 
 ```bash
-sudo cp systemd/netmon.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now netmon
-journalctl -u netmon -f          # watch it live
-sudo systemctl stop netmon       # clean shutdown (runs ownership lookups)
+./deploy.sh --install-service
 ```
 
-The unit sets `TimeoutStopSec=180` so systemd gives the post-run lookups
-time to finish before escalating to SIGKILL.
+That generates the unit from `systemd/netmon.service` with this
+checkout's real paths and your user, installs it to
+`/etc/systemd/system/netmon.service`, enables it, and starts it.
+Compared to `nohup`/backgrounding, systemd gives you the three things a
+monitor actually needs:
+
+* it isn't tied to your terminal session (log out freely);
+* it **starts automatically on boot**, so a power blip to the monitoring
+  box doesn't silently end evidence collection;
+* `Restart=on-failure` brings it back automatically if it ever aborts.
+
+If you'd rather install by hand: edit the two paths in
+`systemd/netmon.service`, then
+`sudo cp systemd/netmon.service /etc/systemd/system/ &&
+sudo systemctl daemon-reload && sudo systemctl enable --now netmon`.
+
+If you had previously started the monitor manually in a terminal, stop
+that one first so two monitors aren't pinging at once.
+
+### Day-to-day management
+
+```bash
+systemctl status netmon          # is it running?
+journalctl -u netmon -f          # watch the live log (outage starts/ends, blips)
+sudo systemctl restart netmon    # restart (rarely needed; deploy.sh does this)
+sudo systemctl stop netmon       # clean shutdown — runs the IP ownership lookups
+sudo systemctl start netmon      # start again after a stop
+```
+
+Stopping (and restarting) is always a *clean* shutdown: in-flight
+traceroutes finish and the post-run IP ownership lookups execute before
+the process exits, so it can take up to a minute. The unit sets
+`TimeoutStopSec=180` so systemd gives that time before escalating to
+SIGKILL.
 
 ### Updating / redeploying
 
