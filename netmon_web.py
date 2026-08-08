@@ -187,6 +187,20 @@ class Site:
                 stats = render_day(
                     self.config.log_dir, day, self.config.chart_dir
                 )
+            except ImportError as exc:
+                # Almost always a numpy/matplotlib ABI mismatch, which is
+                # a broken Python environment rather than anything wrong
+                # with the evidence. Say so, and say how to fix it.
+                traceback.print_exc()
+                return False, (
+                    f"Chart generation failed to import its plotting "
+                    f"dependencies ({exc}). This is a problem with the "
+                    f"Python environment, not with your connection data — "
+                    f"ping logging is unaffected. Rebuild the virtualenv "
+                    f"on the monitoring machine with "
+                    f"'./deploy.sh --rebuild-venv', then restart "
+                    f"netmon-web."
+                )
             except Exception as exc:
                 traceback.print_exc()
                 return False, f"Chart generation failed: {exc!r}"

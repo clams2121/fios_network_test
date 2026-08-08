@@ -222,3 +222,6 @@ logs/
 config.toml
 connection-health*.png
 connection-health*.pdf
+
+# Project virtualenv (created by deploy.sh)
+.venv/
