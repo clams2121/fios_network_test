@@ -1,362 +1,273 @@
 # FiOS network connectivity monitor
 
-A small evidence-collection tool for intermittent internet outages. It
-pings a target once per second, records every result, runs verbose
-traceroutes for the duration of every outage, identifies who owns each hop
-after the run, and renders a static chart you can attach to an email to
-your ISP's support team.
+Evidence-collection for intermittent internet outages. Pings a target once
+per second, runs verbose traceroutes for the duration of every outage,
+identifies who owns each hop, and produces daily charts you can attach to
+an email to your ISP.
 
-Everything stays on your machine. The only packets that leave it are the
-pings, the traceroutes, and (after the run, optionally) the reverse-DNS and
-RDAP ownership lookups.
+Everything stays local. The only packets that leave the machine are the
+pings, the traceroutes, and the ownership lookups (PTR/RDAP, after a run).
 
-## What it produces
+Requires Ubuntu with Python 3.11+ (24.04 LTS ships 3.12). `ping` and
+`traceroute` run unprivileged — no root needed for monitoring.
 
-```
-logs/
-  ping-2026-08-06.jsonl          one JSON record per ping, daily files,
-  ping-2026-08-07.jsonl          rolled at local midnight
-  monitor-errors.log             problems with the MONITOR itself (never
-                                 mixed into the network evidence)
-  ip-ownership.jsonl             one record per unique IP seen in any
-                                 traceroute: PTR name + RDAP org
-  charts/
-    connection-2026-08-06.png    one chart per day, rendered nightly by
-    connection-2026-08-07.png    the web UI (or on demand)
-  traceroutes/
-    traceroute-2026-08-06T14-23-07/     one directory per outage event,
-      traceroute-2026-08-06T14-23-07.txt   named for the event start;
-      traceroute-2026-08-06T14-23-17.txt   one file per traceroute run
-      ...                                  (every 10 s until recovery)
-```
-
-A ping record looks like:
-
-```json
-{"ts": "2026-08-06T14:23:07.100-04:00", "target": "8.8.8.8",
- "success": false, "latency_ms": null, "outage_id": "2026-08-06T14-23-07"}
-```
-
-`outage_id` groups a continuous run of failures into one outage event and
-matches the event's traceroute directory name. Records with
-`"monitor_error": true` (and `success: null`) mean the *tool* had a
-problem — they are never counted as network failures.
-
-## Installation (Ubuntu)
+## Install
 
 ```bash
 git clone https://github.com/clams2121/fios_network_test.git
 cd fios_network_test
-sudo apt install traceroute                      # ping ships with Ubuntu
-cp config.example.toml config.toml               # then edit it
-./deploy.sh --install-service                    # sets up everything else
-```
-
-`deploy.sh` creates a **project virtualenv** in `.venv/` and installs
-matplotlib into it from `requirements.txt`, then points the systemd units
-at that interpreter. The monitor itself (`netmon.py`) is standard library
-only; matplotlib is needed for charts, and keeping it in a virtualenv
-isolates it from whatever else the system Python has installed.
-
-If you'd rather use the system Python (with apt's `python3-matplotlib`),
-pass `--no-venv` to every `deploy.sh` run.
-
-Requires Python 3.11+ (Ubuntu 23.04 or newer; Ubuntu 24.04 LTS ships
-3.12). Python 3.11 is what makes the standard-library TOML parser
-available, so the monitor itself has **zero third-party dependencies**.
-`matplotlib` is the one dependency of the visualization script, because
-rendering publication-quality static images is not something the standard
-library can do.
-
-Both `ping` and `traceroute` work unprivileged on Ubuntu — no root needed.
-
-## Configuration
-
-The config is TOML (`config.example.toml` documents every key). TOML was
-chosen over INI and YAML because it is parseable by the standard library
-alone (3.11+), it has real types — the on-failure action list is an array
-of tables, which INI cannot express — and it has none of YAML's implicit
-typing surprises or dependency cost.
-
-Validation is strict: every key is required, and the monitor exits with a
-message naming the exact problem (missing key, bad IP, absent binary,
-unwritable directory) rather than falling back to any default. A ping
-timeout longer than the ping interval is also rejected, since a
-still-waiting ping would collide with the next scheduled one.
-
-Relative paths are resolved against the config file's directory, so the
-monitor behaves identically no matter where it is launched from (shell or
-systemd).
-
-## Running the monitor
-
-```bash
-python3 netmon.py --config config.toml
-```
-
-Stop it with Ctrl-C or SIGTERM. On shutdown it finishes any in-flight
-traceroute, flushes and closes the logs, and **then** runs the IP ownership
-lookups — deliberately after monitoring ends, because DNS and RDAP are
-themselves unreachable during an outage and mid-outage lookups would fail
-and pollute the evidence. Lookups are cached in `ip-ownership.jsonl`
-across runs, so each IP is only ever queried once.
-
-If a run ends without a clean shutdown (crash, power loss), rebuild the
-ownership file from the traceroute files on disk:
-
-```bash
-python3 netmon_ownership.py --config config.toml --rescan
-```
-
-### Running persistently (systemd)
-
-To have the monitor run all the time, install it as a systemd service —
-no `nohup` needed. The easy way is the deploy script:
-
-```bash
+cp config.example.toml config.toml
+nano config.toml                 # set ping_target_ip, web_bind_ip, etc.
 ./deploy.sh --install-service
 ```
 
-That generates both units (`systemd/netmon.service` and
-`systemd/netmon-web.service`) with this checkout's real paths and your
-user, installs them to `/etc/systemd/system/`, enables them, and starts
-them.
-Compared to `nohup`/backgrounding, systemd gives you the three things a
-monitor actually needs:
+`deploy.sh` does the rest: installs `traceroute` and `python3-venv` if
+missing, creates a virtualenv in `.venv/` with matplotlib, installs and
+starts both systemd services, and prints the web UI's URL.
 
-* it isn't tied to your terminal session (log out freely);
-* it **starts automatically on boot**, so a power blip to the monitoring
-  box doesn't silently end evidence collection;
-* `Restart=on-failure` brings it back automatically if it ever aborts.
+Two services get installed:
 
-If you'd rather install by hand: edit the paths in
-`systemd/netmon.service` and `systemd/netmon-web.service`, then
-`sudo cp systemd/netmon*.service /etc/systemd/system/ &&
-sudo systemctl daemon-reload &&
-sudo systemctl enable --now netmon netmon-web`.
+| Service | Job |
+|---|---|
+| `netmon` | pings, logs, runs traceroutes during outages |
+| `netmon-web` | serves the charts and evidence; renders daily charts |
 
-If you had previously started the monitor manually in a terminal, stop
-that one first so two monitors aren't pinging at once.
+They are independent — restarting the web UI never interrupts monitoring.
 
-### Day-to-day management
+## Update / redeploy
 
-There are two services: `netmon` (collects the evidence) and
-`netmon-web` (serves the charts). They are independent — restarting the
-web UI never interrupts monitoring.
+```bash
+./deploy.sh
+```
+
+Pulls the latest code, refreshes dependencies, validates the config, runs
+the tests, and restarts both services. It stops **before** touching the
+services if any of those steps fail, so a working monitor keeps running.
+
+| Flag | Use |
+|---|---|
+| *(none)* | normal update + restart |
+| `--install-service` | first-time setup: also install and enable the systemd units |
+| `--rebuild-venv` | delete and rebuild `.venv/` — **the fix for broken Python dependencies** (see Troubleshooting) |
+| `--no-venv` | use the system `python3` with apt's `python3-matplotlib` instead of the virtualenv |
+
+Flags can be combined. If the installed units are stale — for example
+still pointing at the system Python after a switch to the virtualenv —
+`deploy.sh` notices and refreshes them.
+
+## Day-to-day
 
 ```bash
 systemctl status netmon netmon-web   # are they running?
-journalctl -u netmon -f              # live monitor log (outage starts/ends, blips)
+journalctl -u netmon -f              # live monitor log (outages, blips)
 journalctl -u netmon-web -f          # live web log (chart renders, requests)
-sudo systemctl restart netmon        # restart (rarely needed; deploy.sh does this)
-sudo systemctl stop netmon           # clean shutdown — runs the IP ownership lookups
-sudo systemctl start netmon          # start again after a stop
+sudo systemctl stop netmon           # clean shutdown
+sudo systemctl start netmon
 ```
 
-Stopping (and restarting) is always a *clean* shutdown: in-flight
-traceroutes finish and the post-run IP ownership lookups execute before
-the process exits, so it can take up to a minute. The unit sets
-`TimeoutStopSec=180` so systemd gives that time before escalating to
-SIGKILL.
-
-### Updating / redeploying
-
-```bash
-./deploy.sh                    # pull latest code, refresh dependencies,
-                               # validate config, run tests, restart services
-./deploy.sh --install-service  # first-time setup: additionally generates
-                               # the systemd units with this checkout's
-                               # paths, interpreter and user, then enables
-                               # and starts them
-./deploy.sh --rebuild-venv     # discard and rebuild .venv from scratch
-                               # (the fix for broken Python dependencies)
-./deploy.sh --no-venv          # use the system python3 instead of .venv
-```
-
-The script is deliberately cautious: it stops before touching the
-services if the pull, the dependency install, the **chart-dependency
-check**, the config validation, or the test suite fails, so a working
-monitor keeps running. The restart itself is a clean shutdown (in-flight
-traceroutes finish, IP ownership lookups run), so it can take a minute.
-Without installed services it just tells you how to run them in the
-foreground.
-
-The chart-dependency check actually imports numpy and matplotlib and
-draws a figure, rather than merely checking that matplotlib is present —
-because the failure mode below passes a presence check but breaks at
-render time. If the units on disk are stale (for example they still point
-at the system Python after a switch to the virtualenv), `deploy.sh`
-notices and refreshes them.
+Stopping or restarting `netmon` is always a clean shutdown: in-flight
+traceroutes finish and the IP ownership lookups run first, so it can take
+up to a minute (`TimeoutStopSec=180`).
 
 ## Troubleshooting
 
 ### `ImportError: numpy.core.multiarray failed to import`
 
-Seen when generating a chart. matplotlib and numpy must be a matched
-pair built against the same ABI; this error means the matplotlib being
-imported was built against a different numpy major version than the one
-actually loaded. It is typically caused by mixing apt's
-`python3-matplotlib` with a pip-installed numpy in the same interpreter.
-Reinstalling numpy on its own does not fix it — the two have to come from
-the same place.
-
-The fix is to give the services their own virtualenv, which is what
-`deploy.sh` does by default:
+Seen when generating a chart. matplotlib and numpy must be a matched pair
+built against the same ABI; this means the matplotlib being imported was
+built against a different numpy major version than the one loaded. It is
+usually caused by mixing apt's `python3-matplotlib` with a pip-installed
+numpy. **Reinstalling numpy alone does not fix it** — both have to come
+from the same place.
 
 ```bash
 ./deploy.sh --rebuild-venv
 ```
 
-That deletes `.venv/`, recreates it (deliberately *without*
-`--system-site-packages`, so the system's conflicting packages are not
-inherited), installs a consistent matplotlib/numpy pair from
-`requirements.txt`, verifies they import and can draw, and updates the
-systemd units to run from that interpreter. Restart afterwards if you
-did not let the script do it:
+That deletes `.venv/`, recreates it (without `--system-site-packages`, so
+the conflicting system packages are not inherited), installs a consistent
+matplotlib/numpy pair, verifies they import and can draw, updates the
+systemd units to use that interpreter, and restarts the services.
 
-```bash
-sudo systemctl restart netmon-web
-```
-
-To confirm which interpreter a service is actually using:
+To check which interpreter a service actually uses:
 
 ```bash
 systemctl show -p ExecStart netmon-web
 .venv/bin/python3 -c "import matplotlib, numpy; print(matplotlib.__version__, numpy.__version__)"
 ```
 
-### The web UI shows a chart error but the monitor is fine
+### Charts fail but the monitor is fine
 
-That is by design — they are separate services. Chart rendering problems
-never interrupt ping logging, so no evidence is lost while you fix the
-Python environment; regenerate the affected days afterwards with the
-button (today) or by restarting `netmon-web`, which backfills any day
-missing a chart.
+Expected — they are separate services, so no ping data is lost while you
+fix the Python environment. Afterwards, restarting `netmon-web` backfills
+every day that is missing a chart.
 
-## Generating the chart
+### A service will not start
 
 ```bash
-python3 visualize.py --config config.toml                       # everything available
-python3 visualize.py --config config.toml --start 2026-08-01 --end 2026-08-07
-python3 visualize.py --config config.toml -o report.png -o report.pdf
+journalctl -u netmon -n 30 --no-pager
 ```
 
-The chart reads across all rolled daily files in the range and shows
-latency over time with outages shaded red, plus a summary line: ping count,
-loss rate, outage count, total downtime, and the longest outage. It also
-prints the same summary as text for pasting into an email body.
+Config problems are reported by name (missing key, bad IP, absent binary,
+unwritable directory). Validate without starting anything:
 
-Evidence-integrity details, all visible in the legend:
-
-* Periods where the **monitor was not running** are shaded gray — absence
-  of data is never mistaken for (or hides) an outage.
-* **Monitor errors** are drawn as separate markers and excluded from all
-  outage statistics.
-* For long ranges the latency line is downsampled to bucket means, and a
-  lighter **max envelope** is drawn as well so short latency spikes are
-  not averaged out of sight. Outage spans and loss statistics are always
-  computed from the raw records, never from the downsampled series.
+```bash
+.venv/bin/python3 netmon.py --config config.toml --check
+```
 
 ## Web UI
 
-A small local web server (standard library only) for browsing the
-evidence day by day:
+Browse the evidence day by day at the address you configured (default
+`http://127.0.0.1:8477/`):
 
-```bash
-python3 netmon_web.py --config config.toml
-```
+* a **sidebar of every day** with ping logs, badged with its outage count;
+* that day's **chart** and headline stats (pings, loss rate, outages,
+  downtime, longest outage);
+* a **"Generate today's chart"** button — today is the only day still
+  accumulating data;
+* **per-outage detail**: start, duration, the hop IPs from its traceroutes
+  joined against `ip-ownership.jsonl` (so you can see whether it broke at
+  your router, inside Verizon, or beyond), and links to the raw captures.
 
-It is normally run as a service — `./deploy.sh --install-service`
-installs it alongside the monitor — and offers:
-
-* **a sidebar of every day** that has ping logs, each with a badge
-  showing that day's outage count;
-* **that day's chart**, plus the headline stats (pings, loss rate,
-  outages, downtime, longest outage);
-* **a "Generate today's chart" button** — today is the only day still
-  accumulating data, so it is the only one worth regenerating on demand;
-* **per-outage detail**: each event's start, duration, the hop IPs seen
-  in its traceroutes joined against `ip-ownership.jsonl` (so you can see
-  where it broke — your router, Verizon, or beyond), and links to the raw
-  capture files.
-
-### Daily charts
-
-The web server renders the chart for the day that just ended at
-`web_daily_chart_hour` (1 AM by default). It also **backfills on
-startup**: any day that has logs but no chart is rendered when the
-service starts, so charts are never permanently missed because the
-server was down overnight.
+Charts for completed days are rendered automatically at
+`web_daily_chart_hour` (1 AM). Any day with logs but no chart is
+backfilled when the service starts, so nothing is permanently missed if
+the server was down overnight.
 
 ### Access and security
 
-The server binds **only** to `web_bind_ip`, and that bind address is the
-entire access-control model — there is no authentication:
+The server binds **only** to `web_bind_ip`. There is no authentication —
+the bind address is the entire access-control model:
 
-| `web_bind_ip` | Who can reach it |
+| `web_bind_ip` | Reachable from |
 |---|---|
-| `127.0.0.1` | only this machine (use `ssh -L 8477:127.0.0.1:8477 host` to view remotely) |
-| your LAN address, e.g. `192.168.1.50` | anything on your LAN |
+| `127.0.0.1` | this machine only (`ssh -L 8477:127.0.0.1:8477 host` to view remotely) |
+| a LAN address, e.g. `192.168.1.50` | anything on your LAN |
 
-Do not bind it to an internet-facing address. Apart from the regenerate
-button the UI is read-only, it serves only files inside the configured
-log/chart/traceroute directories (path traversal is rejected), and the
-web server runs as its own service — restarting or crashing it never
-interrupts the monitor's data collection.
+Do not bind an internet-facing address. Apart from the generate button
+the UI is read-only, and it serves only files inside the configured
+directories (path traversal is rejected).
 
-## How outage response works
+## Charts on the command line
 
-Each second the monitor pings `ping_target_ip` on a fixed-rate schedule
-(the next ping is scheduled at start + N seconds on the monotonic clock,
-so ping duration cannot make the cadence drift — and one ping per second
-means exactly that, never a flood).
+For a single chart spanning multiple days — the one to attach to an
+email:
 
-After `outage_open_after_failures` consecutive failed pings (default 3 in
-the example config; set to 1 for maximum sensitivity) an outage event
-opens, named for — and starting at — the **first** failed ping of the run.
-Failures below the threshold are "blips": still logged and counted in loss
-statistics, but they trigger no traceroutes and no event. Pre-threshold
-failure records are briefly buffered (at most a couple of seconds) so that
-when an outage is confirmed, every record from the first failure onward
-carries the event's id.
-A worker thread runs every configured on-failure action immediately, then
-again every `traceroute_interval_seconds` until a ping succeeds, so a
-shifting failure point is captured over the course of the event. The
-traceroute targets a *different* IP than the ping (`traceroute_target_ip`)
-so one destination network's problem can't blind both probes, and runs
-with `-n` because resolving hop names mid-outage would hang on dead DNS.
+```bash
+.venv/bin/python3 visualize.py --config config.toml
+.venv/bin/python3 visualize.py --config config.toml --start 2026-08-01 --end 2026-08-07
+.venv/bin/python3 visualize.py --config config.toml -o report.png -o report.pdf
+```
 
-**One file per traceroute inside a per-event directory** (rather than one
-growing per-event file) was chosen deliberately: each file is written in a
-single atomic operation after its traceroute completes, so a monitor crash
-or kill mid-outage can never corrupt or truncate previously captured
-traceroutes; each filename carries its own timestamp; and files can be
-globbed, diffed, and attached individually. The `#`-prefixed header in
-each file (command, start/finish time, exit status) keeps the raw tool
-output below it pristine.
+Defaults to everything available. Prints the same summary as text for
+pasting into the email body.
 
-### Joining traceroutes to ownership
+The chart is built to be honest about its own gaps: outages are shaded
+red, periods where **the monitor was not running** are shaded gray (so
+missing data is never mistaken for uptime), and monitor errors are drawn
+as separate markers, excluded from outage statistics. Over long ranges
+the latency line is downsampled to bucket means with a lighter max
+envelope so spikes are not averaged away; outage spans and loss rates
+always come from the raw records.
 
-Every hop IP in every traceroute appears in `logs/ip-ownership.jsonl`:
+## Configuration
+
+TOML, parsed by the standard library. `config.example.toml` documents
+every key. Validation is strict — every key is required and the process
+exits with a message naming the exact problem rather than falling back to
+a default. Relative paths resolve against the config file's directory.
+
+Keys worth knowing:
+
+| Key | Meaning |
+|---|---|
+| `ping_target_ip` | pinged once per `ping_interval_seconds` |
+| `traceroute_target_ip` | traced during outages; deliberately a different host |
+| `outage_open_after_failures` | consecutive lost pings before an outage opens (3) |
+| `traceroute_interval_seconds` | gap between traceroutes during an outage (10) |
+| `web_bind_ip` / `web_port` | web UI address — see Access and security |
+| `web_daily_chart_hour` | hour to render the completed day's chart (1) |
+| `rdap_lookups` | set `false` to skip ownership org lookups (PTR still runs) |
+
+## Files it produces
+
+```
+logs/
+  ping-2026-08-06.jsonl          one JSON record per ping, rolled at
+  ping-2026-08-07.jsonl          local midnight
+  monitor-errors.log             problems with the MONITOR itself
+  ip-ownership.jsonl             PTR + RDAP org per unique hop IP
+  charts/
+    connection-2026-08-06.png    one chart per day
+  traceroutes/
+    traceroute-2026-08-06T14-23-07/       one directory per outage,
+      traceroute-2026-08-06T14-23-07.txt  named for its start; one file
+      traceroute-2026-08-06T14-23-17.txt  per traceroute run
+```
+
+A ping record:
+
+```json
+{"ts": "2026-08-06T14:23:07.100-04:00", "target": "8.8.8.8",
+ "success": false, "latency_ms": null, "outage_id": "2026-08-06T14-23-07"}
+```
+
+`outage_id` groups a run of failures into one event and matches that
+event's traceroute directory name. Records with `"monitor_error": true`
+(and `success: null`) mean the tool had a problem, never the network.
+
+An ownership record, joinable to any hop by `ip`:
 
 ```json
 {"ip": "100.41.135.2", "ptr": "ae201-0.NWRKNJ-VFTTP-311.verizon-gni.net",
- "special": null, "rdap": {"name": "VIS-BLOCK", "org": "Verizon Business",
- "handle": "NET-100-8-0-0-1", "country": null,
- "range": {"start": "100.8.0.0", "end": "100.41.255.255"}},
+ "special": null, "rdap": {"org": "Verizon Business", "name": "VIS-BLOCK"},
  "error": null, "looked_up_at": "2026-08-07T09:12:03-04:00"}
 ```
 
 `special` labels non-public ranges (your router's RFC 1918 address,
-carrier-grade NAT inside the ISP, etc.). RDAP queries go through
-https://rdap.org, which redirects to the authoritative registry (ARIN for
-Verizon space); set `rdap_lookups = false` to keep runs fully offline
-apart from PTR lookups.
+carrier-grade NAT inside the ISP). Lookups run after monitoring stops —
+DNS and RDAP are unreachable mid-outage — and are cached so each IP is
+queried once ever. Rebuild them after an unclean shutdown with:
 
-## Adding your own on-failure actions
+```bash
+.venv/bin/python3 netmon_ownership.py --config config.toml --rescan
+```
 
-The failure response is a config-driven action list — no code changes
-needed for new external checks:
+## How outage detection works
+
+Pings run on a fixed-rate schedule (each ping is scheduled at start + N
+seconds on the monotonic clock, so ping duration cannot make the cadence
+drift).
+
+An outage opens after `outage_open_after_failures` consecutive failures,
+but is timestamped from the **first** failed ping — pre-threshold records
+are buffered briefly and join the event retroactively. Failures that
+recover before the threshold are logged as "blips": counted in loss
+statistics, but no event and no traceroutes.
+
+While an outage is open, every configured on-failure action runs
+immediately and then every `traceroute_interval_seconds`, so a shifting
+failure point is captured over the event. Each run writes its own
+timestamped file (atomically, so a crash cannot truncate earlier
+captures) with a `#`-prefixed header above the raw output.
+
+### "Network down" vs. "monitor broken"
+
+Kept strictly separate, because evidence handed to an ISP must not
+contain your own tool's failures:
+
+| Signal | Meaning | Where it goes |
+|---|---|---|
+| `ping` exits 0 with a latency | network OK | ping log |
+| `ping` exits 1 (no reply) | **network failure** | ping log; opens/extends an outage |
+| `ping` exits 2, won't start, unparseable output; an action crashes | **monitor problem** | `monitor-errors.log` + stderr + a `monitor_error` record; never touches outage state |
+
+Ten consecutive monitor errors abort the run loudly rather than logging
+garbage; `Restart=on-failure` then applies.
+
+## Adding your own on-failure checks
+
+Config-driven, no code changes:
 
 ```toml
 [[on_failure_actions]]
@@ -365,34 +276,32 @@ name = "dns-check"
 command = ["dig", "+time=2", "+tries=1", "@8.8.8.8", "example.com"]
 ```
 
-Every action runs once per cycle during an outage and writes its output to
-`<event dir>/<name>-<timestamp>.txt` with the same header format. For an
-action that needs logic rather than just a command, subclass `Action` in
-`netmon_actions.py` and add one entry to its `ACTION_TYPES` registry.
-
-## "Network down" vs. "monitor broken"
-
-The two are strictly separated, because evidence you hand to an ISP must
-not contain your own tool's failures:
-
-| Signal | Meaning | Where it goes |
-|---|---|---|
-| `ping` exits 1 (no reply) | **network failure** | ping log, opens/extends an outage |
-| `ping` exits 0 with a latency | network OK | ping log |
-| `ping` exits 2, can't start, unparseable output; an action crashes | **monitor problem** | `monitor-errors.log` + stderr + a `monitor_error` ping record; never touches outage state |
-
-Ten consecutive monitor errors abort the run loudly (exit 1) rather than
-logging garbage forever; under systemd, `Restart=on-failure` then applies.
+Each action runs once per cycle during an outage, writing to
+`<event dir>/<name>-<timestamp>.txt`. For logic beyond running a command,
+subclass `Action` in `netmon_actions.py` and register it in
+`ACTION_TYPES`.
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v
+.venv/bin/python3 -m unittest discover -s tests
 ```
 
-Standard-library `unittest` only. Covers outage open/group/close
-semantics, the blip threshold, the monitor-error separation, config
-validation, ping output parsing, IP extraction, the chart's
-outage-span/gap reconstruction, and the web layer — page rendering,
-HTML escaping of on-disk content, path-traversal rejection, and the
-daily scheduler's next-run arithmetic.
+Standard-library `unittest` only. Covers outage lifecycle and the blip
+threshold, monitor-error separation, config validation, ping parsing, IP
+extraction, chart span/gap reconstruction, and the web layer (page
+rendering, HTML escaping, path-traversal rejection, scheduler timing).
+A passing run prints only dots — output from the error paths under test
+is captured deliberately.
+
+## Running without systemd
+
+```bash
+.venv/bin/python3 netmon.py --config config.toml
+.venv/bin/python3 netmon_web.py --config config.toml
+```
+
+Ctrl-C or SIGTERM shuts down cleanly. Prefer the services for anything
+long-running: they survive logout, start on boot, and restart on failure.
+Stop a manually started monitor before starting the service, so two are
+not pinging at once.
