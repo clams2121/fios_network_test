@@ -1,9 +1,18 @@
 """Unit tests (standard-library unittest; no extra dependencies).
 
 Run from the repository root:  python3 -m unittest discover -s tests -v
+
+Console output from the code under test is captured per-test (see
+QuietTestCase) so a passing run stays silent. Several tests deliberately
+drive error paths that log loudly by design — an unexpected traceback in
+the output of a passing run would otherwise look like a real failure.
+Assert on self.captured_err() when the logging itself is the behaviour
+being tested.
 """
 
+import contextlib
 import datetime as dt
+import io
 import json
 import sys
 import tempfile
@@ -18,6 +27,30 @@ from netmon_config import ActionConfig, Config, ConfigError, load_config  # noqa
 from netmon_ownership import _classify  # noqa: E402
 from netmon_web import Handler, Site  # noqa: E402
 from visualize import monitoring_gaps, outage_spans, summarize  # noqa: E402
+
+
+class QuietTestCase(unittest.TestCase):
+    """Captures stdout/stderr for the duration of each test.
+
+    unittest's runner captured the real streams before any test ran, so
+    its own reporting is unaffected.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._out, self._err = io.StringIO(), io.StringIO()
+        for redirect in (
+            contextlib.redirect_stdout(self._out),
+            contextlib.redirect_stderr(self._err),
+        ):
+            redirect.__enter__()
+            self.addCleanup(redirect.__exit__, None, None, None)
+
+    def captured_out(self) -> str:
+        return self._out.getvalue()
+
+    def captured_err(self) -> str:
+        return self._err.getvalue()
 
 
 def make_config(tmp: Path, threshold: int = 1) -> Config:
@@ -45,7 +78,7 @@ def make_config(tmp: Path, threshold: int = 1) -> Config:
     )
 
 
-class OutageLifecycleTest(unittest.TestCase):
+class OutageLifecycleTest(QuietTestCase):
     def test_outage_opens_groups_and_closes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -164,9 +197,12 @@ class OutageLifecycleTest(unittest.TestCase):
             self.assertIn(
                 "boom", (tmp / "logs" / "monitor-errors.log").read_text()
             )
+            # Monitor problems must also be loud on the console, so they
+            # surface in journalctl and not just in the file.
+            self.assertIn("MONITOR ERROR: boom", self.captured_err())
 
 
-class ParsingTest(unittest.TestCase):
+class ParsingTest(QuietTestCase):
     def test_latency_regex(self):
         out = "64 bytes from 8.8.8.8: icmp_seq=1 ttl=115 time=12.4 ms"
         self.assertEqual(float(_LATENCY_RE.search(out).group(1)), 12.4)
@@ -191,7 +227,7 @@ class ParsingTest(unittest.TestCase):
         self.assertIsNone(_classify("8.8.8.8"))
 
 
-class ConfigTest(unittest.TestCase):
+class ConfigTest(QuietTestCase):
     def _write(self, tmp: Path, text: str) -> Path:
         path = tmp / "config.toml"
         path.write_text(text)
@@ -241,7 +277,7 @@ command = ["true"]
                     load_config(self._write(Path(tmpdir), text))
 
 
-class VisualizeTest(unittest.TestCase):
+class VisualizeTest(QuietTestCase):
     def test_spans_and_gaps(self):
         t0 = dt.datetime(2026, 8, 6, 12, 0, 0).astimezone()
 
@@ -272,7 +308,7 @@ class VisualizeTest(unittest.TestCase):
         self.assertEqual(gaps[0], (records[3]["ts"], records[4]["ts"]))
 
 
-class WebTest(unittest.TestCase):
+class WebTest(QuietTestCase):
     """The web layer, exercised without opening a socket."""
 
     def _seed(self, tmp: Path, day: dt.date) -> Site:
@@ -364,6 +400,9 @@ class WebTest(unittest.TestCase):
             self.assertIn("Python environment", message)
             self.assertIn("--rebuild-venv", message)
             self.assertIn("ping logging is unaffected", message)
+            # The traceback still reaches the log for the journal, even
+            # though the user-facing message is the friendly one.
+            self.assertIn("numpy.core.multiarray", self.captured_err())
 
     def test_html_escaping_of_untrusted_disk_content(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -382,7 +421,7 @@ class WebTest(unittest.TestCase):
             self.assertIn("&lt;script&gt;", page)
 
 
-class PathSafetyTest(unittest.TestCase):
+class PathSafetyTest(QuietTestCase):
     """_safe_child must confine every served path to its base directory."""
 
     def setUp(self):
@@ -418,7 +457,7 @@ class PathSafetyTest(unittest.TestCase):
         )
 
 
-class SchedulerTest(unittest.TestCase):
+class SchedulerTest(QuietTestCase):
     def test_next_run_is_the_configured_hour(self):
         from netmon_web import DailyChartScheduler
 
