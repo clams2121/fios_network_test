@@ -344,6 +344,27 @@ class WebTest(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("No ping data", message)
 
+    def test_import_error_reports_environment_not_data_problem(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            day = dt.date(2026, 8, 5)
+            site = self._seed(tmp, day)
+            import netmon_web
+
+            def boom(*_a, **_kw):
+                raise ImportError("numpy.core.multiarray failed to import")
+
+            original = netmon_web.render_day
+            netmon_web.render_day = boom
+            try:
+                ok, message = site.generate(day)
+            finally:
+                netmon_web.render_day = original
+            self.assertFalse(ok)
+            self.assertIn("Python environment", message)
+            self.assertIn("--rebuild-venv", message)
+            self.assertIn("ping logging is unaffected", message)
+
     def test_html_escaping_of_untrusted_disk_content(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

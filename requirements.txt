@@ -1,0 +1,11 @@
+# Third-party dependencies, installed into the project virtualenv by
+# ./deploy.sh.  The monitor itself (netmon.py) needs nothing here — it is
+# standard library only.  matplotlib is required by visualize.py and by
+# the web UI's chart rendering.
+#
+# numpy is deliberately NOT pinned separately: pip resolves the numpy that
+# matches the matplotlib wheel it installs.  Mixing an apt-installed
+# matplotlib with a pip-installed numpy (or vice versa) is what produces
+# "ImportError: numpy.core.multiarray failed to import" — a virtualenv
+# built from this file keeps the pair consistent.
+matplotlib >= 3.6

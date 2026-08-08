@@ -47,14 +47,19 @@ problem — they are never counted as network failures.
 ```bash
 git clone https://github.com/clams2121/fios_network_test.git
 cd fios_network_test
-sudo apt install traceroute python3-matplotlib   # ping ships with Ubuntu
+sudo apt install traceroute                      # ping ships with Ubuntu
 cp config.example.toml config.toml               # then edit it
+./deploy.sh --install-service                    # sets up everything else
 ```
 
-(`python3-matplotlib` comes from apt rather than pip because Ubuntu 23.04+
-marks the system Python as externally managed, so a bare `pip install`
-fails; the apt package sidesteps that and is only needed for
-`visualize.py`. If you prefer pip, use a virtualenv.)
+`deploy.sh` creates a **project virtualenv** in `.venv/` and installs
+matplotlib into it from `requirements.txt`, then points the systemd units
+at that interpreter. The monitor itself (`netmon.py`) is standard library
+only; matplotlib is needed for charts, and keeping it in a virtualenv
+isolates it from whatever else the system Python has installed.
+
+If you'd rather use the system Python (with apt's `python3-matplotlib`),
+pass `--no-venv` to every `deploy.sh` run.
 
 Requires Python 3.11+ (Ubuntu 23.04 or newer; Ubuntu 24.04 LTS ships
 3.12). Python 3.11 is what makes the standard-library TOML parser
@@ -158,18 +163,75 @@ SIGKILL.
 
 ```bash
 ./deploy.sh                    # pull latest code, refresh dependencies,
-                               # validate config, run tests, restart service
+                               # validate config, run tests, restart services
 ./deploy.sh --install-service  # first-time setup: additionally generates
-                               # the systemd unit with this checkout's
-                               # paths and your user, enables and starts it
+                               # the systemd units with this checkout's
+                               # paths, interpreter and user, then enables
+                               # and starts them
+./deploy.sh --rebuild-venv     # discard and rebuild .venv from scratch
+                               # (the fix for broken Python dependencies)
+./deploy.sh --no-venv          # use the system python3 instead of .venv
 ```
 
-The script is deliberately cautious: it stops before touching the service
-if the pull, the dependency install, the config validation, or the test
-suite fails, so a working monitor keeps running. The restart itself is a
-clean shutdown (in-flight traceroutes finish, IP ownership lookups run),
-so it can take a minute. Without an installed service it just tells you
-how to run the monitor in the foreground.
+The script is deliberately cautious: it stops before touching the
+services if the pull, the dependency install, the **chart-dependency
+check**, the config validation, or the test suite fails, so a working
+monitor keeps running. The restart itself is a clean shutdown (in-flight
+traceroutes finish, IP ownership lookups run), so it can take a minute.
+Without installed services it just tells you how to run them in the
+foreground.
+
+The chart-dependency check actually imports numpy and matplotlib and
+draws a figure, rather than merely checking that matplotlib is present —
+because the failure mode below passes a presence check but breaks at
+render time. If the units on disk are stale (for example they still point
+at the system Python after a switch to the virtualenv), `deploy.sh`
+notices and refreshes them.
+
+## Troubleshooting
+
+### `ImportError: numpy.core.multiarray failed to import`
+
+Seen when generating a chart. matplotlib and numpy must be a matched
+pair built against the same ABI; this error means the matplotlib being
+imported was built against a different numpy major version than the one
+actually loaded. It is typically caused by mixing apt's
+`python3-matplotlib` with a pip-installed numpy in the same interpreter.
+Reinstalling numpy on its own does not fix it — the two have to come from
+the same place.
+
+The fix is to give the services their own virtualenv, which is what
+`deploy.sh` does by default:
+
+```bash
+./deploy.sh --rebuild-venv
+```
+
+That deletes `.venv/`, recreates it (deliberately *without*
+`--system-site-packages`, so the system's conflicting packages are not
+inherited), installs a consistent matplotlib/numpy pair from
+`requirements.txt`, verifies they import and can draw, and updates the
+systemd units to run from that interpreter. Restart afterwards if you
+did not let the script do it:
+
+```bash
+sudo systemctl restart netmon-web
+```
+
+To confirm which interpreter a service is actually using:
+
+```bash
+systemctl show -p ExecStart netmon-web
+.venv/bin/python3 -c "import matplotlib, numpy; print(matplotlib.__version__, numpy.__version__)"
+```
+
+### The web UI shows a chart error but the monitor is fine
+
+That is by design — they are separate services. Chart rendering problems
+never interrupt ping logging, so no evidence is lost while you fix the
+Python environment; regenerate the affected days afterwards with the
+button (today) or by restarting `netmon-web`, which backfills any day
+missing a chart.
 
 ## Generating the chart
 
